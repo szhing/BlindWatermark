@@ -11,16 +11,17 @@ import os
 class DWTSteganoser:
     def Embed(self,src_img,payload_img):
         # src_img:载体图像; payload_img:水印图像;都为Image对象
-        width,height = src_img.size
 
-        # 读取原图  
+        # 设置密匙
         bwm = WaterMark(password_wm=1, password_img=1)
+
+        # 处理原图  
         bwm.read_img(src_img)
 
-        # 读取水印
+        # 处理水印
         bwm.read_wm(payload_img)
 
-        # 返回叠加水印后的载体图像
+        # 返回叠加水印后的载体图像并且转化成RGB格式
         steg_img = bwm.embed()
         steg_img = Opencv_to_image(steg_img, "RGB")
 
@@ -45,79 +46,16 @@ class DWTSteganoser:
         print ("[+] Extracted successfully!")
         return watermark_img
 
-
 class WaterMark:
     def __init__(self, password_wm=1, password_img=1, block_shape=(4, 4)):
-        self.bwm_core = WaterMarkCore(password_img=password_img)
-
-        self.password_wm = password_wm
-
-        self.wm_bit = None
-        self.wm_size = 0
-
-    def read_img(self, img):
-
-        img = Image_to_opencv(img, "IMREAD_UNCHANGED")
-
-        self.bwm_core.read_img_arr(img)
-        return img
-    def read_wm(self, img):
-        wm = Image_to_opencv(img, "IMREAD_GRAYSCALE")
-
-        # 读入图片格式的水印，并转为一维 bit 格式，抛弃灰度级别
-        self.wm_bit = wm.flatten() > 128
-        self.wm_size = self.wm_bit.size
-
-        # 水印加密:
-        np.random.RandomState(self.password_wm).shuffle(self.wm_bit)
-        self.bwm_core.read_wm(self.wm_bit)
-
-    def embed(self):
-        
-        embed_img = self.bwm_core.embed()
-
-        return embed_img
-
-    def extract_decrypt(self, wm_avg):
-        wm_index = np.arange(self.wm_size)
-        np.random.RandomState(self.password_wm).shuffle(wm_index)
-        wm_avg[wm_index] = wm_avg.copy()
-        return wm_avg
-
-    def extract(self, img, wm_shape):
-
-        embed_img = Image_to_opencv(img, "IMREAD_COLOR")
-
-        self.wm_size = np.array(wm_shape).prod()
-
-        wm_avg = self.bwm_core.extract(img=embed_img, wm_shape=wm_shape)
-
-        # 解密：
-        wm = self.extract_decrypt(wm_avg=wm_avg)
-
-        # 转化为指定格式：
-        wm = 255 * wm.reshape(wm_shape[0], wm_shape[1])
-
-        return wm
-    
-class CommonPool(object):
-    def map(self, func, args):
-        return list(map(func, args))
-
-class AutoPool(object):
-    def __init__(self):
-
-        self.mode = 'common'
-        self.processes = None
-        self.pool = CommonPool()   
-
-    def map(self, func, args):
-        return self.pool.map(func, args)
-
-class WaterMarkCore:
-    def __init__(self, password_img=1):
+        # 分块尺寸
         self.block_shape = np.array([4, 4])
+
+        # 设置密匙
+        self.password_wm = password_wm
         self.password_img = password_img
+
+        # svd的参数
         self.d1, self.d2 = 36, 20  # d1/d2 越大鲁棒性越强,但输出图片的失真越大
 
         self.img, self.img_YUV = None, None  # self.img 是原图，self.img_YUV 对像素做了加白偶数化
@@ -126,17 +64,17 @@ class WaterMarkCore:
         self.ca_part = [np.array([])] * 3  # 四维分块后，有时因不整除而少一部分，self.ca_part 是少这一部分的 self.ca
 
         self.wm_size, self.block_num = 0, 0  # 水印的长度，原图片可插入信息的个数
-        self.pool = AutoPool()
 
         self.alpha = None  # 用于处理透明图
+        self.wm_bit = None # 图片格式的水印
+        self.wm_size = 0 # 图片格式的水印的尺寸
 
-    def init_block_index(self):
-        self.block_num = self.ca_block_shape[0] * self.ca_block_shape[1]
-        # self.part_shape 是取整后的ca二维大小,用于嵌入时忽略右边和下面对不齐的细条部分。
-        self.part_shape = self.ca_block_shape[:2] * self.block_shape
-        self.block_index = [(i, j) for i in range(self.ca_block_shape[0]) for j in range(self.ca_block_shape[1])]
+    def read_img(self, img, extra = None):
 
-    def read_img_arr(self, img):
+        # 将图片转化成Opencv格式
+        if extra == None:
+            img = Image_to_opencv(img, "IMREAD_UNCHANGED")
+
         # 处理透明图
         self.alpha = None
         if img.shape[2] == 4:
@@ -164,22 +102,69 @@ class WaterMarkCore:
             # 转为4维度
             self.ca_block[channel] = np.lib.stride_tricks.as_strided(self.ca[channel].astype(np.float32),
                                                                      self.ca_block_shape, strides)
+        return img
+    
+    def read_wm(self, img):
+        
+        # 将图片转化成Opencv格式
+        wm = Image_to_opencv(img, "IMREAD_GRAYSCALE")
 
-    def read_wm(self, wm_bit):
-        self.wm_bit = wm_bit
-        self.wm_size = wm_bit.size
+        # 读入图片格式的水印，并转为一维 bit 格式，抛弃灰度级别
+        self.wm_bit = wm.flatten() > 128
+        self.wm_size = self.wm_bit.size
 
-    def block_add_wm(self, arg):
-        # dct->svd->打水印->逆svd->逆dct
-        block, shuffler, i = arg
-        wm_1 = self.wm_bit[i % self.wm_size]
+        # 水印加密:
+        np.random.RandomState(self.password_wm).shuffle(self.wm_bit)
+        self.wm_size = self.wm_bit.size
+    
+    def extract(self, img, wm_shape):
 
-        u, s, v = svd(dct(block))
-        s[0] = (s[0] // self.d1 + 1 / 4 + 1 / 2 * wm_1) * self.d1
+        # 将图片转化成Opencv格式
+        embed_img = Image_to_opencv(img, "IMREAD_COLOR")
 
-        return idct(np.dot(u, np.dot(np.diag(s), v)))
+        # 保存水印的尺寸
+        self.wm_size = np.array(wm_shape).prod()
+
+        # 提取每个分块埋入的 bit,每个分块提取 1 bit 信息
+        self.read_img(embed_img, 1)
+        self.init_block_index()
+
+        wm_block_bit = np.zeros(shape=(3, self.block_num))  # 3个channel，length 个分块提取的水印，全都记录下来
+
+        self.idx_shuffle = random_strategy1(seed=self.password_img,
+                                            size=self.block_num,
+                                            block_shape=self.block_shape[0] * self.block_shape[1],  # 16
+                                            )
+        for channel in range(3):
+            wm_block_bit[channel, :] = list(map(self.block_get_wm,
+                                                     [(self.ca_block[channel][self.block_index[i]], self.idx_shuffle[i])
+                                                      for i in range(self.block_num)]))
+
+        # 做平均,对循环嵌入+3个 channel 求平均
+        wm_avg = np.zeros(shape=self.wm_size)
+        for i in range(self.wm_size):
+            wm_avg[i] = wm_block_bit[:, i::self.wm_size].mean()
+
+        self.wm_size = np.array(wm_shape).prod()
+
+        # 解密：
+        wm_index = np.arange(self.wm_size)
+        np.random.RandomState(self.password_wm).shuffle(wm_index)
+        wm_avg[wm_index] = wm_avg.copy()
+
+        # 转化为指定格式：
+        wm_avg = 255 * wm_avg.reshape(wm_shape[0], wm_shape[1])
+
+        return wm_avg
+
+    def init_block_index(self):
+        self.block_num = self.ca_block_shape[0] * self.ca_block_shape[1]
+        # self.part_shape 是取整后的ca二维大小,用于嵌入时忽略右边和下面对不齐的细条部分。
+        self.part_shape = self.ca_block_shape[:2] * self.block_shape
+        self.block_index = [(i, j) for i in range(self.ca_block_shape[0]) for j in range(self.ca_block_shape[1])]
         
     def embed(self):
+        # 初始化分块的大小
         self.init_block_index()
 
         embed_ca = copy.deepcopy(self.ca)
@@ -188,9 +173,9 @@ class WaterMarkCore:
         self.idx_shuffle = random_strategy1(self.password_img, self.block_num,
                                             self.block_shape[0] * self.block_shape[1])
         for channel in range(3):
-            tmp = self.pool.map(self.block_add_wm,
+            tmp = list(map(self.block_add_wm,
                                 [(self.ca_block[channel][self.block_index[i]], self.idx_shuffle[i], i)
-                                 for i in range(self.block_num)])
+                                 for i in range(self.block_num)]))
 
             for i in range(self.block_num):
                 self.ca_block[channel][self.block_index[i]] = tmp[i]
@@ -213,6 +198,16 @@ class WaterMarkCore:
             embed_img = cv2.merge([embed_img.astype(np.uint8), self.alpha])
         return embed_img
 
+    def block_add_wm(self, arg):
+        # dct->svd->打水印->逆svd->逆dct
+        block, shuffler, i = arg
+        wm_1 = self.wm_bit[i % self.wm_size]
+
+        u, s, v = svd(dct(block))
+        s[0] = (s[0] // self.d1 + 1 / 4 + 1 / 2 * wm_1) * self.d1
+
+        return idct(np.dot(u, np.dot(np.diag(s), v)))
+    
     def block_get_wm(self, args):
         block, shuffler = args
         # dct->svd->解水印
@@ -221,45 +216,14 @@ class WaterMarkCore:
 
         return wm
     
-    def extract_raw(self, img):
-        # 每个分块提取 1 bit 信息
-        self.read_img_arr(img)
-        self.init_block_index()
-
-        wm_block_bit = np.zeros(shape=(3, self.block_num))  # 3个channel，length 个分块提取的水印，全都记录下来
-
-        self.idx_shuffle = random_strategy1(seed=self.password_img,
-                                            size=self.block_num,
-                                            block_shape=self.block_shape[0] * self.block_shape[1],  # 16
-                                            )
-        for channel in range(3):
-            wm_block_bit[channel, :] = self.pool.map(self.block_get_wm,
-                                                     [(self.ca_block[channel][self.block_index[i]], self.idx_shuffle[i])
-                                                      for i in range(self.block_num)])
-        return wm_block_bit
-
-    def extract_avg(self, wm_block_bit):
-        # 对循环嵌入+3个 channel 求平均
-        wm_avg = np.zeros(shape=self.wm_size)
-        for i in range(self.wm_size):
-            wm_avg[i] = wm_block_bit[:, i::self.wm_size].mean()
-        return wm_avg
-
-    def extract(self, img, wm_shape):
-        self.wm_size = np.array(wm_shape).prod()
-
-        # 提取每个分块埋入的 bit：
-        wm_block_bit = self.extract_raw(img=img)
-        # 做平均：
-        wm_avg = self.extract_avg(wm_block_bit)
-        return wm_avg
-
 def random_strategy1(seed, size, block_shape):
+    # 选择随机打乱顺序
     return np.random.RandomState(seed) \
         .random(size=(size, block_shape)) \
         .argsort(axis=1)
 
 def Image_to_opencv(img, mode):
+    # 将Image格式转换成Opencv的mode格式
     img.save("A.png")
     if mode == "IMREAD_UNCHANGED":
         img = cv2.imread("A.png", cv2.IMREAD_UNCHANGED)
@@ -271,8 +235,8 @@ def Image_to_opencv(img, mode):
     return img
 
 def Opencv_to_image(ope, mode):
+    # 将Opencv格式转换成Image的mode格式
     cv2.imwrite('A.png',ope)
     ope = Image.open('A.png').convert(mode)
     os.remove('A.png')
     return ope
-    
